@@ -1,0 +1,1271 @@
+module test2 (
+    input clk,             // 50MHz 主時脈 (LP-2900 板載)
+    input reset,           // 異步重置 (全部歸零)
+    input [7:0] sw,        // 8 個按鈕: SW1~SW8
+    output reg [7:0] segout,
+    output reg [2:0] scanout,
+    output reg [11:0] led, // L1~L12 (紅/黃/綠 x 4組)
+    output led_com         // LED_COM 腳位 N20
+);
+
+//---------------------------------------------------------
+// 1. 分頻器：產生 1秒脈波、LED閃爍頻率、長按快調時脈
+//---------------------------------------------------------
+reg [25:0] cnt_scan;
+reg [25:0] cnt_1sec;
+reg one_sec_tick;
+
+// 閃爍與快調頻率
+wire blink_clk = cnt_scan[24]; // 約 1.5Hz 鬧鐘閃爍
+wire auto_inc_clk = cnt_scan[22]; // 約 6Hz：按住按鈕時連續增加的速度
+
+// 取得連續增加的單週期脈波 (避免重複累加)
+reg auto_inc_prev;
+wire auto_inc_tick = (~auto_inc_prev && auto_inc_clk);
+
+always @(posedge clk or posedge reset) begin
+    if (reset) begin
+        cnt_scan      <= 26'd0;
+        cnt_1sec      <= 26'd0;
+        one_sec_tick  <= 1'b0;
+        auto_inc_prev <= 1'b0;
+    end else begin
+        cnt_scan      <= cnt_scan + 1'b1;
+        auto_inc_prev <= auto_inc_clk;
+
+        // 50MHz: 計數 50,000,000 次 (49,999,999) 產生精確 1 秒脈波
+        if (cnt_1sec >= 26'd49_999_999) begin
+            cnt_1sec     <= 26'd0;
+            one_sec_tick <= 1'b1;
+        end else begin
+            cnt_1sec     <= cnt_1sec + 1'b1;
+            one_sec_tick <= 1'b0;
+        end
+    end
+end
+
+//---------------------------------------------------------
+// 2. 按鍵同步與邊緣檢測 (Active-Low 按壓判定)
+//---------------------------------------------------------
+reg [7:0] sw_sync;
+reg [7:0] sw_prev;
+wire [7:0] btn_pressed;
+wire [7:0] btn_held;
+
+always @(posedge clk or posedge reset) begin
+    if (reset) begin
+        sw_sync <= 8'hFF;
+        sw_prev <= 8'hFF;
+    end else begin
+        sw_sync <= sw;
+        sw_prev <= sw_sync;
+    end
+end
+
+assign btn_pressed = sw_prev & ~sw_sync; // 下壓瞬間邊緣 (單次觸發)
+assign btn_held    = ~sw_sync;           // 按住中為 1
+
+wire mode_set_time  = btn_held[7]; // 按住 SW8: 調整時間模式
+wire mode_set_alarm = btn_held[6]; // 按住 SW7: 調整鬧鐘模式
+
+// 按住按鍵時持續觸發累加信號 (單擊立即加 1，按住則持續每秒加數次)
+wire [5:0] inc_trig;
+genvar i;
+generate
+    for (i = 0; i < 6; i = i + 1) begin : gen_trig
+        assign inc_trig[i] = btn_pressed[i] || (btn_held[i] && auto_inc_tick);
+    end
+endgenerate
+
+//---------------------------------------------------------
+// 3. 走時暫停 / 啟動旗標 (按 SW8 單擊可切換)
+//---------------------------------------------------------
+reg clock_running;
+always @(posedge clk or posedge reset) begin
+    if (reset) begin
+        clock_running <= 1'b1; // 預設走時
+    end else begin
+        // 若在未進入改鬧鐘模式下，短按 SW8 可切換 暫停 / 繼續
+        if (!mode_set_alarm && btn_pressed[7]) begin
+            clock_running <= ~clock_running;
+        end
+    end
+end
+
+//---------------------------------------------------------
+// 4. 時間暫存器與進位控制
+//---------------------------------------------------------
+reg [3:0] q0, q1, q2, q3, q4, q5;             // 現在時間 HH:MM:SS
+reg [3:0] al_q0, al_q1, al_q2, al_q3, al_q4, al_q5; // 鬧鐘時間 HH:MM:SS
+
+always @(posedge clk or posedge reset) begin
+    if (reset) begin
+        q0 <= 4'd0; q1 <= 4'd0; q2 <= 4'd0;
+        q3 <= 4'd0; q4 <= 4'd0; q5 <= 4'd0;
+        al_q0 <= 4'd0; al_q1 <= 4'd0; al_q2 <= 4'd0;
+        al_q3 <= 4'd0; al_q4 <= 4'd0; al_q5 <= 4'd0;
+    end else begin
+        // ==========================================
+        // 模式 A: 按住 SW8 調整時間 (支援長按持續累加)
+        // ==========================================
+        if (mode_set_time) begin
+            // SW1 (秒個位 0~9)
+            if (inc_trig[0]) q0 <= (q0 >= 4'd9) ? 4'd0 : (q0 + 1'b1);
+            // SW2 (秒十位 0~5)
+            if (inc_trig[1]) q1 <= (q1 >= 4'd5) ? 4'd0 : (q1 + 1'b1);
+            // SW3 (分個位 0~9)
+            if (inc_trig[2]) q2 <= (q2 >= 4'd9) ? 4'd0 : (q2 + 1'b1);
+            // SW4 (分十位 0~5)
+            if (inc_trig[3]) q3 <= (q3 >= 4'd5) ? 4'd0 : (q3 + 1'b1);
+            // SW5 (時個位)
+            if (inc_trig[4]) begin
+                if (q5 == 4'd2 && q4 >= 4'd3) q4 <= 4'd0;
+                else if (q4 >= 4'd9)           q4 <= 4'd0;
+                else                           q4 <= q4 + 1'b1;
+            end
+            // SW6 (時十位 0~2)
+            if (inc_trig[5]) begin
+                if (q5 >= 4'd2) begin
+                    q5 <= 4'd0;
+                end else if (q5 == 4'd1 && q4 > 4'd3) begin
+                    q5 <= 4'd2;
+                    q4 <= 4'd3;
+                end else begin
+                    q5 <= q5 + 1'b1;
+                end
+            end
+        end
+
+        // ==========================================
+        // 模式 B: 按住 SW7 調整鬧鐘 (支援長按持續累加)
+        // ==========================================
+        else if (mode_set_alarm) begin
+            if (inc_trig[0]) al_q0 <= (al_q0 >= 4'd9) ? 4'd0 : (al_q0 + 1'b1);
+            if (inc_trig[1]) al_q1 <= (al_q1 >= 4'd5) ? 4'd0 : (al_q1 + 1'b1);
+            if (inc_trig[2]) al_q2 <= (al_q2 >= 4'd9) ? 4'd0 : (al_q2 + 1'b1);
+            if (inc_trig[3]) al_q3 <= (al_q3 >= 4'd5) ? 4'd0 : (al_q3 + 1'b1);
+            if (inc_trig[4]) begin
+                if (al_q5 == 4'd2 && al_q4 >= 4'd3) al_q4 <= 4'd0;
+                else if (al_q4 >= 4'd9)              al_q4 <= 4'd0;
+                else                                 al_q4 <= al_q4 + 1'b1;
+            end
+            if (inc_trig[5]) begin
+                if (al_q5 >= 4'd2) begin
+                    al_q5 <= 4'd0;
+                end else if (al_q5 == 4'd1 && al_q4 > 4'd3) begin
+                    al_q5 <= 4'd2;
+                    al_q4 <= 4'd3;
+                end else begin
+                    al_q5 <= al_q5 + 1'b1;
+                end
+            end
+        end
+
+        // ==========================================
+        // 模式 C: 正常走時 (受 clock_running 啟停控制)
+        // ==========================================
+        else if (one_sec_tick && clock_running) begin
+            if (q0 < 4'd9) begin
+                q0 <= q0 + 1'b1;
+            end else begin
+                q0 <= 4'd0;
+                if (q1 < 4'd5) begin
+                    q1 <= q1 + 1'b1;
+                end else begin
+                    q1 <= 4'd0;
+                    if (q2 < 4'd9) begin
+                        q2 <= q2 + 1'b1;
+                    end else begin
+                        q2 <= 4'd0;
+                        if (q3 < 4'd5) begin
+                            q3 <= q3 + 1'b1;
+                        end else begin
+                            q3 <= 4'd0;
+                            if (q5 == 4'd2 && q4 == 4'd3) begin
+                                q4 <= 4'd0;
+                                q5 <= 4'd0;
+                            end else if (q4 < 4'd9) begin
+                                q4 <= q4 + 1'b1;
+                            end else begin
+                                q4 <= 4'd0;
+                                q5 <= q5 + 1'b1;
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+//---------------------------------------------------------
+// 5. 鬧鐘比對與 12 顆 LED 閃爍輸出
+//---------------------------------------------------------
+wire alarm_match = ({q5, q4, q3, q2, q1, q0} == {al_q5, al_q4, al_q3, al_q2, al_q1, al_q0});
+
+assign led_com = 1'b0; // 共同端接地 (共陰極)
+
+always @(*) begin
+    if (alarm_match && blink_clk) begin
+        led = 12'b1111_1111_1111;
+    end else begin
+        led = 12'b0000_0000_0000;
+    end
+end
+
+//---------------------------------------------------------
+// 6. 七段顯示掃描與顯示控制
+//---------------------------------------------------------
+reg [3:0] disp_q0, disp_q1, disp_q2, disp_q3, disp_q4, disp_q5;
+
+always @(*) begin
+    if (mode_set_alarm) begin
+        disp_q0 = al_q0; disp_q1 = al_q1; disp_q2 = al_q2;
+        disp_q3 = al_q3; disp_q4 = al_q4; disp_q5 = al_q5;
+    end else begin
+        disp_q0 = q0;    disp_q1 = q1;    disp_q2 = q2;
+        disp_q3 = q3;    disp_q4 = q4;    disp_q5 = q5;
+    end
+end
+
+always @(*) begin
+    scanout = cnt_scan[15:13];
+end
+
+reg [3:0] sel;
+always @(*) begin
+    case (scanout)
+        3'b000:  sel = disp_q5; // 時十位
+        3'b001:  sel = disp_q4; // 時個位
+        3'b010:  sel = disp_q3; // 分十位
+        3'b011:  sel = disp_q2; // 分個位
+        3'b100:  sel = disp_q1; // 秒十位
+        3'b101:  sel = disp_q0; // 秒個位
+        default: sel = 4'h0;
+    endcase
+end
+
+// 七段顯示解碼器 (共陰極：高電位點亮)
+always @(*) begin
+    case (sel)
+        4'h0:    segout = 8'b00111111;
+        4'h1:    segout = 8'b00000110;
+        4'h2:    segout = 8'b01011011;
+        4'h3:    segout = 8'b01001111;
+        4'h4:    segout = 8'b01100110;
+        4'h5:    segout = 8'b01101101;
+        4'h6:    segout = 8'b01111101;
+        4'h7:    segout = 8'b00000111;
+        4'h8:    segout = 8'b01111111;
+        4'h9:    segout = 8'b01100111;
+        default: segout = 8'b00000000;
+    endcase
+end
+
+endmodule 我需要一個時鐘隨秒數增加六個7SEG顯示器分別顯示小時分鐘以及秒數 SW8按壓下去可以更改時間 邊 原處發放開後停止更改 SW7是鬧鐘按壓下去依樣考已改變時間放開停止更改 SW1-SW6p 別控制更改的方式當更改石按壓下去會隨秒數增加放開後停止更改
+針對你的需求：
+
+正常走時：每秒自動遞增，六位七段顯示器分別顯示 HH:MM:SS。
+
+模式控制：
+
+按住 SW8：進入「調整時間模式」，放開停止調整回到走時。
+
+按住 SW7：進入「調整鬧鐘模式」，放開停止調整回到走時。
+
+位數微調 (SW1~SW6)：在調整模式下，按住對應按鍵時隨每秒遞增（1秒加1次），放開即停止。
+
+完整修改後的 Verilog 程式碼如下：
+
+Verilog
+module test2 (
+    input clk,              // 50MHz 主時脈 (LP-2900 板載)
+    input reset,            // 異步重置 (高電位觸發，全部歸零)
+    input [7:0] sw,         // 8 個按鍵: SW1~SW8 (低電位按下: Active-Low)
+    output reg [7:0] segout,// 七段顯示器段信號 (abcdefg, dp)
+    output reg [2:0] scanout,// 七段顯示器掃描選擇 (0~5)
+    output reg [11:0] led,  // L1~L12 鬧鐘指示燈
+    output led_com          // LED 共同端 (LP-2900 N20 腳位)
+);
+
+//---------------------------------------------------------
+// 1. 分頻器：產生 1秒脈波 (走時與按住調整共用)、LED 閃爍
+//---------------------------------------------------------
+reg [25:0] cnt_scan;
+reg [25:0] cnt_1sec;
+reg one_sec_tick;
+
+wire blink_clk = cnt_scan[24]; // 約 1.5Hz 鬧鐘響起時 LED 閃爍
+
+always @(posedge clk or posedge reset) begin
+    if (reset) begin
+        cnt_scan     <= 26'd0;
+        cnt_1sec     <= 26'd0;
+        one_sec_tick <= 1'b0;
+    end else begin
+        cnt_scan <= cnt_scan + 1'b1;
+
+        // 50MHz: 計數 50,000,000 次 (49,999,999) 產生精準 1 秒脈波
+        if (cnt_1sec >= 26'd49_999_999) begin
+            cnt_1sec     <= 26'd0;
+            one_sec_tick <= 1'b1;
+        end else begin
+            cnt_1sec     <= cnt_1sec + 1'b1;
+            one_sec_tick <= 1'b0;
+        end
+    end
+end
+
+//---------------------------------------------------------
+// 2. 按鍵同步與檢測 (Active-Low 按壓判定)
+//---------------------------------------------------------
+reg [7:0] sw_sync;
+reg [7:0] sw_prev;
+wire [7:0] btn_pressed;
+wire [7:0] btn_held;
+
+always @(posedge clk or posedge reset) begin
+    if (reset) begin
+        sw_sync <= 8'hFF;
+        sw_prev <= 8'hFF;
+    end else begin
+        sw_sync <= sw;
+        sw_prev <= sw_sync;
+    end
+end
+
+assign btn_pressed = sw_prev & ~sw_sync; // 下壓瞬間邊緣觸發
+assign btn_held    = ~sw_sync;           // 持續按住為 1
+
+wire mode_set_time  = btn_held[7]; // 按住 SW8: 進入修改時間模式
+wire mode_set_alarm = btn_held[6]; // 按住 SW7: 進入修改鬧鐘模式
+
+// 按住時隨秒數遞增：下壓瞬間加 1，若持續按住則在每個 1 秒脈波 (one_sec_tick) 再加 1
+wire [5:0] inc_trig;
+genvar i;
+generate
+    for (i = 0; i < 6; i = i + 1) begin : gen_trig
+        assign inc_trig[i] = btn_pressed[i] || (btn_held[i] && one_sec_tick);
+    end
+endgenerate
+
+//---------------------------------------------------------
+// 3. 時間暫存器與遞增進位邏輯
+//    q0~q5: 現在時間 / al_q0~al_q5: 鬧鐘時間
+//---------------------------------------------------------
+reg [3:0] q0, q1, q2, q3, q4, q5;             // 秒個位, 秒十位, 分個位, 分十位, 時個位, 時十位
+reg [3:0] al_q0, al_q1, al_q2, al_q3, al_q4, al_q5;
+
+always @(posedge clk or posedge reset) begin
+    if (reset) begin
+        q0 <= 4'd0; q1 <= 4'd0; q2 <= 4'd0;
+        q3 <= 4'd0; q4 <= 4'd0; q5 <= 4'd0;
+        al_q0 <= 4'd0; al_q1 <= 4'd0; al_q2 <= 4'd0;
+        al_q3 <= 4'd0; al_q4 <= 4'd0; al_q5 <= 4'd0;
+    end else begin
+        // ==========================================
+        // 模式 A: 按住 SW8 調整時間 (SW1~SW6 按住隨秒數增加)
+        // ==========================================
+        if (mode_set_time) begin
+            // SW1: 秒個位 (0~9)
+            if (inc_trig[0]) q0 <= (q0 >= 4'd9) ? 4'd0 : (q0 + 1'b1);
+            // SW2: 秒十位 (0~5)
+            if (inc_trig[1]) q1 <= (q1 >= 4'd5) ? 4'd0 : (q1 + 1'b1);
+            // SW3: 分個位 (0~9)
+            if (inc_trig[2]) q2 <= (q2 >= 4'd9) ? 4'd0 : (q2 + 1'b1);
+            // SW4: 分十位 (0~5)
+            if (inc_trig[3]) q3 <= (q3 >= 4'd5) ? 4'd0 : (q3 + 1'b1);
+            // SW5: 時個位 (依十位限制在 0~9 或 0~3)
+            if (inc_trig[4]) begin
+                if (q5 == 4'd2 && q4 >= 4'd3) q4 <= 4'd0;
+                else if (q4 >= 4'd9)           q4 <= 4'd0;
+                else                          q4 <= q4 + 1'b1;
+            end
+            // SW6: 時十位 (0~2，若到2時個位大於3需箝位)
+            if (inc_trig[5]) begin
+                if (q5 >= 4'd2) begin
+                    q5 <= 4'd0;
+                end else if (q5 == 4'd1 && q4 > 4'd3) begin
+                    q5 <= 4'd2;
+                    q4 <= 4'd3;
+                end else begin
+                    q5 <= q5 + 1'b1;
+                end
+            end
+        end
+
+        // ==========================================
+        // 模式 B: 按住 SW7 調整鬧鐘 (SW1~SW6 按住隨秒數增加)
+        // ==========================================
+        else if (mode_set_alarm) begin
+            if (inc_trig[0]) al_q0 <= (al_q0 >= 4'd9) ? 4'd0 : (al_q0 + 1'b1);
+            if (inc_trig[1]) al_q1 <= (al_q1 >= 4'd5) ? 4'd0 : (al_q1 + 1'b1);
+            if (inc_trig[2]) al_q2 <= (al_q2 >= 4'd9) ? 4'd0 : (al_q2 + 1'b1);
+            if (inc_trig[3]) al_q3 <= (al_q3 >= 4'd5) ? 4'd0 : (al_q3 + 1'b1);
+            if (inc_trig[4]) begin
+                if (al_q5 == 4'd2 && al_q4 >= 4'd3) al_q4 <= 4'd0;
+                else if (al_q4 >= 4'd9)              al_q4 <= 4'd0;
+                else                                 al_q4 <= al_q4 + 1'b1;
+            end
+            if (inc_trig[5]) begin
+                if (al_q5 >= 4'd2) begin
+                    al_q5 <= 4'd0;
+                end else if (al_q5 == 4'd1 && al_q4 > 4'd3) begin
+                    al_q5 <= 4'd2;
+                    al_q4 <= 4'd3;
+                end else begin
+                    al_q5 <= al_q5 + 1'b1;
+                end
+            end
+        end
+
+        // ==========================================
+        // 模式 C: 正常走時 (每秒 tick 觸發標準進位)
+        // ==========================================
+        else if (one_sec_tick) begin
+            if (q0 < 4'd9) begin
+                q0 <= q0 + 1'b1;
+            end else begin
+                q0 <= 4'd0;
+                if (q1 < 4'd5) begin
+                    q1 <= q1 + 1'b1;
+                end else begin
+                    q1 <= 4'd0;
+                    if (q2 < 4'd9) begin
+                        q2 <= q2 + 1'b1;
+                    end else begin
+                        q2 <= 4'd0;
+                        if (q3 < 4'd5) begin
+                            q3 <= q3 + 1'b1;
+                        end else begin
+                            q3 <= 4'd0;
+                            if (q5 == 4'd2 && q4 == 4'd3) begin
+                                q4 <= 4'd0;
+                                q5 <= 4'd0;
+                            end else if (q4 < 4'd9) begin
+                                q4 <= q4 + 1'b1;
+                            end else begin
+                                q4 <= 4'd0;
+                                q5 <= q5 + 1'b1;
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+//---------------------------------------------------------
+// 4. 鬧鐘比對與 12 顆 LED 輸出 (同時間閃爍)
+//---------------------------------------------------------
+wire alarm_match = ({q5, q4, q3, q2, q1, q0} == {al_q5, al_q4, al_q3, al_q2, al_q1, al_q0});
+
+assign led_com = 1'b0; // 共同端接地 (LP-2900 預設共陰極)
+
+always @(*) begin
+    if (alarm_match && blink_clk) begin
+        led = 12'b1111_1111_1111;
+    end else begin
+        led = 12'b0000_0000_0000;
+    end
+end
+
+//---------------------------------------------------------
+// 5. 七段顯示掃描 (動態顯示 HH:MM:SS)
+//---------------------------------------------------------
+reg [3:0] disp_q0, disp_q1, disp_q2, disp_q3, disp_q4, disp_q5;
+
+// 當按住 SW7 改鬧鐘時，螢幕切換顯示目前鬧鐘設定數值
+always @(*) begin
+    if (mode_set_alarm) begin
+        disp_q0 = al_q0; disp_q1 = al_q1; disp_q2 = al_q2;
+        disp_q3 = al_q3; disp_q4 = al_q4; disp_q5 = al_q5;
+    end else begin
+        disp_q0 = q0;    disp_q1 = q1;    disp_q2 = q2;
+        disp_q3 = q3;    disp_q4 = q4;    disp_q5 = q5;
+    end
+end
+
+// 掃描頻率選擇 (約 1kHz 輪流點亮 6 個顯示器)
+always @(*) begin
+    scanout = cnt_scan[15:13];
+end
+
+reg [3:0] sel;
+always @(*) begin
+    case (scanout)
+        3'b000:  sel = disp_q5; // 顯示器 1: 時十位
+        3'b001:  sel = disp_q4; // 顯示器 2: 時個位
+        3'b010:  sel = disp_q3; // 顯示器 3: 分十位
+        3'b011:  sel = disp_q2; // 顯示器 4: 分個位
+        3'b100:  sel = disp_q1; // 顯示器 5: 秒十位
+        3'b101:  sel = disp_q0; // 顯示器 6: 秒個位
+        default: sel = 4'h0;
+    endcase
+end
+
+// 七段顯示解碼 (共陰極：1 點亮)
+always @(*) begin
+    case (sel)
+        4'h0:    segout = 8'b00111111;
+        4'h1:    segout = 8'b00000110;
+        4'h2:    segout = 8'b01011011;
+        4'h3:    segout = 8'b01001111;
+        4'h4:    segout = 8'b01100110;
+        4'h5:    segout = 8'b01101101;
+        4'h6:    segout = 8'b01111101;
+        4'h7:    segout = 8'b00000111;
+        4'h8:    segout = 8'b01111111;
+        4'h9:    segout = 8'b01100111;
+        default: segout = 8'b00000000;
+    endcase
+end
+
+endmodule
+關鍵修改細節說明
+隨秒數遞增控制 (inc_trig)：原程式使用的是約 6Hz 的高頻時脈快調，現改為 btn_pressed[i] || (btn_held[i] && one_sec_tick)。當按鍵下壓瞬間會立即加 1，若持續按住不放，則會同步跟隨標準的 1 秒脈波（one_sec_tick）每秒遞增 1。
+
+放開即停止：由 btn_held 與 mode_set_time / mode_set_alarm 控制。只要手放開 SW8 或 SW7，立刻脫離設定模式恢復走時；放開 SW1~SW6 則停止對應欄位的數值累加。
+
+按鍵映射配置：
+
+SW1：秒個位（0~9）
+
+SW2：秒十位（0~5）
+
+SW3：分個位（0~9）
+
+SW4：分十位（0~5）
+
+SW5：時個位（0~9，20~23 時限制在 0~3）
+
+SW6：時十位（0~2）
+
+按壓下去的對應數字方更改
+如果你的意思是：「按住 SW8（或 SW7）進入更改模式時，只有『目前按住的那個數字位』會隨每秒跳動增加，放開就停止；沒按的位數完全保持不動」，而且按住期間該位數每秒加 1（放開就立刻停止）。
+
+下面是已經幫你調整好的寫法。將觸發條件精準綁定在 btn_held[i] && one_sec_tick（只有該鍵被按住時，才隨著每秒 pulse 累加）：
+
+Verilog
+module test2 (
+    input clk,              // 50MHz 主時脈 (LP-2900 板載)
+    input reset,            // 異步重置 (全部歸零)
+    input [7:0] sw,         // 8 個按鍵: SW1~SW8 (低電位觸發: Active-Low)
+    output reg [7:0] segout,
+    output reg [2:0] scanout,
+    output reg [11:0] led,  // 鬧鐘響起時 12 顆 LED 閃爍
+    output led_com          // LED 共陰接地端
+);
+
+//---------------------------------------------------------
+// 1. 分頻器：產生 1秒脈波與 LED 閃爍頻率
+//---------------------------------------------------------
+reg [25:0] cnt_scan;
+reg [25:0] cnt_1sec;
+reg one_sec_tick;
+
+wire blink_clk = cnt_scan[24]; // 鬧鐘 LED 閃爍頻率
+
+always @(posedge clk or posedge reset) begin
+    if (reset) begin
+        cnt_scan     <= 26'd0;
+        cnt_1sec     <= 26'd0;
+        one_sec_tick <= 1'b0;
+    end else begin
+        cnt_scan <= cnt_scan + 1'b1;
+
+        // 50MHz 計數產生每 1 秒一次的單週期 pulse
+        if (cnt_1sec >= 26'd49_999_999) begin
+            cnt_1sec     <= 26'd0;
+            one_sec_tick <= 1'b1;
+        end else begin
+            cnt_1sec     <= cnt_1sec + 1'b1;
+            one_sec_tick <= 1'b0;
+        end
+    end
+end
+
+//---------------------------------------------------------
+// 2. 按鍵讀取 (Active-Low 按壓判定)
+//---------------------------------------------------------
+reg [7:0] sw_sync;
+always @(posedge clk or posedge reset) begin
+    if (reset) sw_sync <= 8'hFF;
+    else       sw_sync <= sw;
+end
+
+wire [7:0] btn_held = ~sw_sync; // 按鍵按住中為 1，放開為 0
+
+wire mode_set_time  = btn_held[7]; // 按住 SW8: 時間更改模式 (放開恢復走時)
+wire mode_set_alarm = btn_held[6]; // 按住 SW7: 鬧鐘更改模式 (放開恢復走時)
+
+// 只有在「按住該按鍵」且「剛好遇到 1 秒 pulse」時，才累加該數字 (放開就立刻停止)
+wire [5:0] inc_trig;
+genvar i;
+generate
+    for (i = 0; i < 6; i = i + 1) begin : gen_trig
+        assign inc_trig[i] = btn_held[i] && one_sec_tick;
+    end
+endgenerate
+
+//---------------------------------------------------------
+// 3. 六位數暫存器 (q: 目前時間, al_q: 鬧鐘設定)
+//---------------------------------------------------------
+reg [3:0] q0, q1, q2, q3, q4, q5;             // 秒個、秒十、分個、分十、時個、時十
+reg [3:0] al_q0, al_q1, al_q2, al_q3, al_q4, al_q5;
+
+always @(posedge clk or posedge reset) begin
+    if (reset) begin
+        q0 <= 4'd0; q1 <= 4'd0; q2 <= 4'd0;
+        q3 <= 4'd0; q4 <= 4'd0; q5 <= 4'd0;
+        al_q0 <= 4'd0; al_q1 <= 4'd0; al_q2 <= 4'd0;
+        al_q3 <= 4'd0; al_q4 <= 4'd0; al_q5 <= 4'd0;
+    end else begin
+        // ==========================================
+        // 模式 A: 按住 SW8 更改時間
+        // 按住 SW1~SW6 哪一顆，哪一位數就每秒加 1，放開即停
+        // ==========================================
+        if (mode_set_time) begin
+            // SW1: 秒個位 (0~9)
+            if (inc_trig[0]) q0 <= (q0 >= 4'd9) ? 4'd0 : (q0 + 1'b1);
+
+            // SW2: 秒十位 (0~5)
+            if (inc_trig[1]) q1 <= (q1 >= 4'd5) ? 4'd0 : (q1 + 1'b1);
+
+            // SW3: 分個位 (0~9)
+            if (inc_trig[2]) q2 <= (q2 >= 4'd9) ? 4'd0 : (q2 + 1'b1);
+
+            // SW4: 分十位 (0~5)
+            if (inc_trig[3]) q3 <= (q3 >= 4'd5) ? 4'd0 : (q3 + 1'b1);
+
+            // SW5: 時個位 (0~9，20點以上上限為 3)
+            if (inc_trig[4]) begin
+                if (q5 == 4'd2 && q4 >= 4'd3) q4 <= 4'd0;
+                else if (q4 >= 4'd9)           q4 <= 4'd0;
+                else                          q4 <= q4 + 1'b1;
+            end
+
+            // SW6: 時十位 (0~2)
+            if (inc_trig[5]) begin
+                if (q5 >= 4'd2) begin
+                    q5 <= 4'd0;
+                end else if (q5 == 4'd1 && q4 > 4'd3) begin
+                    q5 <= 4'd2;
+                    q4 <= 4'd3;
+                end else begin
+                    q5 <= q5 + 1'b1;
+                end
+            end
+        end
+
+        // ==========================================
+        // 模式 B: 按住 SW7 更改鬧鐘
+        // 按住 SW1~SW6 哪一顆，鬧鐘該位數就每秒加 1，放開即停
+        // ==========================================
+        else if (mode_set_alarm) begin
+            // SW1: 鬧鐘秒個位
+            if (inc_trig[0]) al_q0 <= (al_q0 >= 4'd9) ? 4'd0 : (al_q0 + 1'b1);
+
+            // SW2: 鬧鐘秒十位
+            if (inc_trig[1]) al_q1 <= (al_q1 >= 4'd5) ? 4'd0 : (al_q1 + 1'b1);
+
+            // SW3: 鬧鐘分個位
+            if (inc_trig[2]) al_q2 <= (al_q2 >= 4'd9) ? 4'd0 : (al_q2 + 1'b1);
+
+            // SW4: 鬧鐘分十位
+            if (inc_trig[3]) al_q3 <= (al_q3 >= 4'd5) ? 4'd0 : (al_q3 + 1'b1);
+
+            // SW5: 鬧鐘時個位
+            if (inc_trig[4]) begin
+                if (al_q5 == 4'd2 && al_q4 >= 4'd3) al_q4 <= 4'd0;
+                else if (al_q4 >= 4'd9)              al_q4 <= 4'd0;
+                else                                 al_q4 <= al_q4 + 1'b1;
+            end
+
+            // SW6: 鬧鐘時十位
+            if (inc_trig[5]) begin
+                if (al_q5 >= 4'd2) begin
+                    al_q5 <= 4'd0;
+                end else if (al_q5 == 4'd1 && al_q4 > 4'd3) begin
+                    al_q5 <= 4'd2;
+                    al_q4 <= 4'd3;
+                end else begin
+                    al_q5 <= al_q5 + 1'b1;
+                end
+            end
+        end
+
+        // ==========================================
+        // 模式 C: 正常走時 (手完全放開 SW7/SW8 時)
+        // 每一秒鐘自動進位
+        // ==========================================
+        else if (one_sec_tick) begin
+            if (q0 < 4'd9) begin
+                q0 <= q0 + 1'b1;
+            end else begin
+                q0 <= 4'd0;
+                if (q1 < 4'd5) begin
+                    q1 <= q1 + 1'b1;
+                end else begin
+                    q1 <= 4'd0;
+                    if (q2 < 4'd9) begin
+                        q2 <= q2 + 1'b1;
+                    end else begin
+                        q2 <= 4'd0;
+                        if (q3 < 4'd5) begin
+                            q3 <= q3 + 1'b1;
+                        end else begin
+                            q3 <= 4'd0;
+                            if (q5 == 4'd2 && q4 == 4'd3) begin
+                                q4 <= 4'd0;
+                                q5 <= 4'd0;
+                            end else if (q4 < 4'd9) begin
+                                q4 <= q4 + 1'b1;
+                            end else begin
+                                q4 <= 4'd0;
+                                q5 <= q5 + 1'b1;
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+//---------------------------------------------------------
+// 4. 鬧鐘檢查 (目前時間 == 鬧鐘時間 觸發閃爍)
+//---------------------------------------------------------
+wire alarm_match = ({q5, q4, q3, q2, q1, q0} == {al_q5, al_q4, al_q3, al_q2, al_q1, al_q0});
+
+assign led_com = 1'b0; // 共陰極共同端接地
+
+always @(*) begin
+    if (alarm_match && blink_clk)
+        led = 12'b1111_1111_1111;
+    else
+        led = 12'b0000_0000_0000;
+end
+
+//---------------------------------------------------------
+// 5. 掃描與七段顯示解碼 (按住 SW7 時預覽鬧鐘數值)
+//---------------------------------------------------------
+reg [3:0] disp_q0, disp_q1, disp_q2, disp_q3, disp_q4, disp_q5;
+
+always @(*) begin
+    if (mode_set_alarm) begin
+        disp_q0 = al_q0; disp_q1 = al_q1; disp_q2 = al_q2;
+        disp_q3 = al_q3; disp_q4 = al_q4; disp_q5 = al_q5;
+    end else begin
+        disp_q0 = q0;    disp_q1 = q1;    disp_q2 = q2;
+        disp_q3 = q3;    disp_q4 = q4;    disp_q5 = q5;
+    end
+end
+
+always @(*) begin
+    scanout = cnt_scan[15:13]; // 掃描切換頻率
+end
+
+reg [3:0] sel;
+always @(*) begin
+    case (scanout)
+        3'b000:  sel = disp_q5; // 顯示器 1: 時十位
+        3'b001:  sel = disp_q4; // 顯示器 2: 時個位
+        3'b010:  sel = disp_q3; // 顯示器 3: 分十位
+        3'b011:  sel = disp_q2; // 顯示器 4: 分個位
+        3'b100:  sel = disp_q1; // 顯示器 5: 秒十位
+        3'b101:  sel = disp_q0; // 顯示器 6: 秒個位
+        default: sel = 4'h0;
+    endcase
+end
+
+// 七段顯示 (共陰極：1 點亮)
+always @(*) begin
+    case (sel)
+        4'h0:    segout = 8'b00111111;
+        4'h1:    segout = 8'b00000110;
+        4'h2:    segout = 8'b01011011;
+        4'h3:    segout = 8'b01001111;
+        4'h4:    segout = 8'b01100110;
+        4'h5:    segout = 8'b01101101;
+        4'h6:    segout = 8'b01111101;
+        4'h7:    segout = 8'b00000111;
+        4'h8:    segout = 8'b01111111;
+        4'h9:    segout = 8'b01100111;
+        default: segout = 8'b00000000;
+    endcase
+end
+
+endmodule
+操作方式
+調時間：按住 SW8 不放，同時按住 SW1~SW6 其中一個按鍵，只有該位數會每秒遞增一次（1秒+1）；手一放開該鍵立即停止遞增；SW8 放開後恢復正常走時。
+
+調鬧鐘：按住 SW7 不放（螢幕會切換成顯示鬧鐘數值），同時按住 SW1~SW6 進行單獨位數調整；放開 SW7 後自動儲存並切回走時。
+
+按鍵對應位數：
+
+SW1：秒個位
+
+SW2：秒十位
+
+SW3：分個位
+
+SW4：分十位
+
+SW5：時個位
+
+SW6：時十位
+
+按壓下去的數字更改不是除了按壓的全部隨時間增加 然後原本時間也不會跑
+抓到問題點了！
+
+之前的邏輯在進入設定模式時：
+
+分頻器（cnt_1sec）還在背景一直跑，如果按住按鍵的時間點剛好撞到每秒的 pulse，會造成無法精確控制。
+
+調整時的增加速度不應該綁在「正常時鐘的 1 秒」，而是應該用一個獨立的調整步進時脈（例如 2Hz 或 4Hz，即每 0.5 秒或 0.25 秒加一次）。
+
+最關鍵的走時凍結：只要進入設定時間模式（按住 SW8）或鬧鐘模式（按住 SW7），時鐘的 1 秒計數器與走時必須完全暫停，放開 SW8/SW7 後才從設定好的數字繼續走。
+
+位數完全獨立：只改被按下的那一顆按鍵對應的位數，其他位數絕對不變、不進位，放開立即停止。
+
+修正後的完整 Verilog 程式碼如下：
+
+Verilog
+module test2 (
+    input clk,              // 50MHz 主時脈 (LP-2900 板載)
+    input reset,            // 異步重置 (高電位全部歸零)
+    input [7:0] sw,         // 8 個按鍵: SW1~SW8 (低電位按壓: Active-Low)
+    output reg [7:0] segout,
+    output reg [2:0] scanout,
+    output reg [11:0] led,  // 鬧鐘響起時 12 顆 LED 閃爍
+    output led_com          // LED 共陰接地端
+);
+
+//---------------------------------------------------------
+// 1. 按鍵讀取 (Active-Low 判定)
+//---------------------------------------------------------
+reg [7:0] sw_sync;
+always @(posedge clk or posedge reset) begin
+    if (reset) sw_sync <= 8'hFF;
+    else       sw_sync <= sw;
+end
+
+wire [7:0] btn_held = ~sw_sync; // 按住為 1，放開為 0
+
+wire mode_set_time  = btn_held[7]; // 按住 SW8: 進入時間設定 (時間凍結)
+wire mode_set_alarm = btn_held[6]; // 按住 SW7: 進入鬧鐘設定 (時間凍結)
+
+// 是否處於任何設定模式 (若在設定中，時鐘完全停走)
+wire is_setting = mode_set_time || mode_set_alarm;
+
+//---------------------------------------------------------
+// 2. 分頻器：1秒走時脈波、LED閃爍、調整按鍵步進時脈
+//---------------------------------------------------------
+reg [25:0] cnt_scan;
+reg [25:0] cnt_1sec;
+reg one_sec_tick;
+
+wire blink_clk = cnt_scan[24]; // 鬧鐘 LED 閃爍頻率
+
+// 設定模式下，按住 SW1~SW6 時數字遞增的速度 (cnt_scan[23] 約為 3Hz，即 1 秒跳 3 次，好按不暴衝)
+wire adjust_clk = cnt_scan[23];
+reg adjust_clk_prev;
+wire adjust_tick = (~adjust_clk_prev && adjust_clk); // 取正緣單週期脈波
+
+always @(posedge clk or posedge reset) begin
+    if (reset) begin
+        cnt_scan        <= 26'd0;
+        cnt_1sec        <= 26'd0;
+        one_sec_tick    <= 1'b0;
+        adjust_clk_prev <= 1'b0;
+    end else begin
+        cnt_scan        <= cnt_scan + 1'b1;
+        adjust_clk_prev <= adjust_clk;
+
+        // 關鍵：只要按住 SW8 或 SW7，1秒計時器凍結歸零，時鐘原時間完全不跑！
+        if (is_setting) begin
+            cnt_1sec     <= 26'd0;
+            one_sec_tick <= 1'b0;
+        end else begin
+            if (cnt_1sec >= 26'd49_999_999) begin
+                cnt_1sec     <= 26'd0;
+                one_sec_tick <= 1'b1;
+            end else begin
+                cnt_1sec     <= cnt_1sec + 1'b1;
+                one_sec_tick <= 1'b0;
+            end
+        end
+    end
+end
+
+// 只有在按住該位數按鍵時，才產生累加觸發
+wire [5:0] inc_trig;
+genvar i;
+generate
+    for (i = 0; i < 6; i = i + 1) begin : gen_trig
+        assign inc_trig[i] = btn_held[i] && adjust_tick;
+    end
+endgenerate
+
+//---------------------------------------------------------
+// 3. 時間與鬧鐘暫存器
+//---------------------------------------------------------
+reg [3:0] q0, q1, q2, q3, q4, q5;             // 秒個、秒十、分個、分十、時個、時十
+reg [3:0] al_q0, al_q1, al_q2, al_q3, al_q4, al_q5;
+
+always @(posedge clk or posedge reset) begin
+    if (reset) begin
+        q0 <= 4'd0; q1 <= 4'd0; q2 <= 4'd0;
+        q3 <= 4'd0; q4 <= 4'd0; q5 <= 4'd0;
+        al_q0 <= 4'd0; al_q1 <= 4'd0; al_q2 <= 4'd0;
+        al_q3 <= 4'd0; al_q4 <= 4'd0; al_q5 <= 4'd0;
+    end else begin
+        // ==========================================
+        // 模式 A: 按住 SW8 改時間
+        // 原本的時間完全停止！只有被按住的那個位數會獨立增加，放開即停。
+        // ==========================================
+        if (mode_set_time) begin
+            // SW1: 秒個位 (0~9 循環，不影響十位)
+            if (inc_trig[0]) q0 <= (q0 >= 4'd9) ? 4'd0 : (q0 + 1'b1);
+
+            // SW2: 秒十位 (0~5 循環，不影響其他位)
+            if (inc_trig[1]) q1 <= (q1 >= 4'd5) ? 4'd0 : (q1 + 1'b1);
+
+            // SW3: 分個位 (0~9 循環)
+            if (inc_trig[2]) q2 <= (q2 >= 4'd9) ? 4'd0 : (q2 + 1'b1);
+
+            // SW4: 分十位 (0~5 循環)
+            if (inc_trig[3]) q3 <= (q3 >= 4'd5) ? 4'd0 : (q3 + 1'b1);
+
+            // SW5: 時個位 (依十位限制在 0~9 或 0~3)
+            if (inc_trig[4]) begin
+                if (q5 == 4'd2 && q4 >= 4'd3) q4 <= 4'd0;
+                else if (q4 >= 4'd9)           q4 <= 4'd0;
+                else                          q4 <= q4 + 1'b1;
+            end
+
+            // SW6: 時十位 (0~2 循環)
+            if (inc_trig[5]) begin
+                if (q5 >= 4'd2) begin
+                    q5 <= 4'd0;
+                end else if (q5 == 4'd1 && q4 > 4'd3) begin
+                    q5 <= 4'd2;
+                    q4 <= 4'd3;
+                end else begin
+                    q5 <= q5 + 1'b1;
+                end
+            end
+        end
+
+        // ==========================================
+        // 模式 B: 按住 SW7 改鬧鐘
+        // 只有被按住的那個鬧鐘位數會改變，放開即停。
+        // ==========================================
+        else if (mode_set_alarm) begin
+            if (inc_trig[0]) al_q0 <= (al_q0 >= 4'd9) ? 4'd0 : (al_q0 + 1'b1);
+            if (inc_trig[1]) al_q1 <= (al_q1 >= 4'd5) ? 4'd0 : (al_q1 + 1'b1);
+            if (inc_trig[2]) al_q2 <= (al_q2 >= 4'd9) ? 4'd0 : (al_q2 + 1'b1);
+            if (inc_trig[3]) al_q3 <= (al_q3 >= 4'd5) ? 4'd0 : (al_q3 + 1'b1);
+            if (inc_trig[4]) begin
+                if (al_q5 == 4'd2 && al_q4 >= 4'd3) al_q4 <= 4'd0;
+                else if (al_q4 >= 4'd9)              al_q4 <= 4'd0;
+                else                                 al_q4 <= al_q4 + 1'b1;
+            end
+            if (inc_trig[5]) begin
+                if (al_q5 >= 4'd2) begin
+                    al_q5 <= 4'd0;
+                end else if (al_q5 == 4'd1 && al_q4 > 4'd3) begin
+                    al_q5 <= 4'd2;
+                    al_q4 <= 4'd3;
+                end else begin
+                    al_q5 <= al_q5 + 1'b1;
+                end
+            end
+        end
+
+        // ==========================================
+        // 模式 C: 正常走時
+        // 只有在放開 SW8 與 SW7 時，時間才會隨 1 秒 pulse 前進進位
+        // ==========================================
+        else if (one_sec_tick) begin
+            if (q0 < 4'd9) begin
+                q0 <= q0 + 1'b1;
+            end else begin
+                q0 <= 4'd0;
+                if (q1 < 4'd5) begin
+                    q1 <= q1 + 1'b1;
+                end else begin
+                    q1 <= 4'd0;
+                    if (q2 < 4'd9) begin
+                        q2 <= q2 + 1'b1;
+                    end else begin
+                        q2 <= 4'd0;
+                        if (q3 < 4'd5) begin
+                            q3 <= q3 + 1'b1;
+                        end else begin
+                            q3 <= 4'd0;
+                            if (q5 == 4'd2 && q4 == 4'd3) begin
+                                q4 <= 4'd0;
+                                q5 <= 4'd0;
+                            end else if (q4 < 4'd9) begin
+                                q4 <= q4 + 1'b1;
+                            end else begin
+                                q4 <= 4'd0;
+                                q5 <= q5 + 1'b1;
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+//---------------------------------------------------------
+// 4. 鬧鐘檢查與 LED 閃爍輸出
+//---------------------------------------------------------
+wire alarm_match = ({q5, q4, q3, q2, q1, q0} == {al_q5, al_q4, al_q3, al_q2, al_q1, al_q0});
+
+assign led_com = 1'b0; // 共陰極共同端接地
+
+always @(*) begin
+    if (alarm_match && blink_clk)
+        led = 12'b1111_1111_1111;
+    else
+        led = 12'b0000_0000_0000;
+end
+
+//---------------------------------------------------------
+// 5. 掃描與七段顯示解碼
+//---------------------------------------------------------
+reg [3:0] disp_q0, disp_q1, disp_q2, disp_q3, disp_q4, disp_q5;
+
+always @(*) begin
+    if (mode_set_alarm) begin
+        disp_q0 = al_q0; disp_q1 = al_q1; disp_q2 = al_q2;
+        disp_q3 = al_q3; disp_q4 = al_q4; disp_q5 = al_q5;
+    end else begin
+        disp_q0 = q0;    disp_q1 = q1;    disp_q2 = q2;
+        disp_q3 = q3;    disp_q4 = q4;    disp_q5 = q5;
+    end
+end
+
+always @(*) begin
+    scanout = cnt_scan[15:13]; // 顯示掃描切換
+end
+
+reg [3:0] sel;
+always @(*) begin
+    case (scanout)
+        3'b000:  sel = disp_q5; // 時十位
+        3'b001:  sel = disp_q4; // 時個位
+        3'b010:  sel = disp_q3; // 分十位
+        3'b011:  sel = disp_q2; // 分個位
+        3'b100:  sel = disp_q1; // 秒十位
+        3'b101:  sel = disp_q0; // 秒個位
+        default: sel = 4'h0;
+    endcase
+end
+
+// 七段顯示 (共陰極：高電位 1 點亮)
+always @(*) begin
+    case (sel)
+        4'h0:    segout = 8'b00111111;
+        4'h1:    segout = 8'b00000110;
+        4'h2:    segout = 8'b01011011;
+        4'h3:    segout = 8'b01001111;
+        4'h4:    segout = 8'b01100110;
+        4'h5:    segout = 8'b01101101;
+        4'h6:    segout = 8'b01111101;
+        4'h7:    segout = 8'b00000111;
+        4'h8:    segout = 8'b01111111;
+        4'h9:    segout = 8'b01100111;
+        default: segout = 8'b00000000;
+    endcase
+end
+
+endmodule
+做了哪些改變？
+原本時間完全凍結（不會跑）：
+在分頻器中加入 if (is_setting) 判斷，只要按住 SW8 或 SW7，cnt_1sec 和 one_sec_tick 會被直接壓制歸零。手放開按鍵的瞬間，才會重新從 0 計數 1 秒並繼續走時。
+
+只有被按下的位數會動：
+inc_trig[i] 分別對應 SW1~SW6。只有被按下的那一位會每步進一次加 1，其他 5 個位數不會有任何觸發訊號，保持原值不動。
+
+獨立調整頻率：
+使用 adjust_tick（約 3Hz）作為調整時的步進速度。按住時會穩定以每秒 3 次的速度累加，一放開按鍵立即煞車停止。
+
+按壓更改時不是else if (mode_set_alarm) begin
+            if (inc_trig[0]) al_q0 <= (al_q0 >= 4'd9) ? 4'd0 : (al_q0 + 1'b1);
+            if (inc_trig[1]) al_q1 <= (al_q1 >= 4'd5) ? 4'd0 : (al_q1 + 1'b1);
+            if (inc_trig[2]) al_q2 <= (al_q2 >= 4'd9) ? 4'd0 : (al_q2 + 1'b1);
+            if (inc_trig[3]) al_q3 <= (al_q3 >= 4'd5) ? 4'd0 : (al_q3 + 1'b1);
+            if (inc_trig[4]) begin
+                if (al_q5 == 4'd2 && al_q4 >= 4'd3) al_q4 <= 4'd0;
+                else if (al_q4 >= 4'd9)              al_q4 <= 4'd0;
+                else                                 al_q4 <= al_q4 + 1'b1;
+            end
+            if (inc_trig[5]) begin
+                if (al_q5 >= 4'd2) begin
+                    al_q5 <= 4'd0;
+                end else if (al_q5 == 4'd1 && al_q4 > 4'd3) begin
+                    al_q5 <= 4'd2;
+                    al_q4 <= 4'd3;
+                end else begin
+                    al_q5 <= al_q5 + 1'b1;
+                end
+            end
+        end 假設按壓SW8要更改再按壓SW6才調整SW6 對應的數字開始 其他都不會動
+在 Verilog 語法中，目前這段寫法本身是獨立條件判斷（6 個各自獨立的 if）：
+
+Verilog
+if (inc_trig[0]) al_q0 <= ...;
+if (inc_trig[1]) al_q1 <= ...;
+...
+if (inc_trig[5]) al_q5 <= ...;
+它本來就具備「按 SW6 只會觸發 inc_trig[5]，其他 al_q0~al_q4 都不會動」的特性。
+
+但是在實體電路板（LP-2900）上實際測試時，往往會覺得「其他數字也在跑」或「按了全部都在動」，主因是以下兩個硬體與邏輯細節：
+
+原因與癥結點
+按鍵硬體特性（Active-Low 與浮接問題）：
+
+LP-2900 的按鈕通常是 未按下為高電位（1），按下為低電位（0）。
+
+如果 sw 陣列在未按下時不是穩定的 1（例如腳位定義錯或有雜訊），~sw_sync 就會判定成「全部按鍵都被按住」，導致 6 位數全部都在跳。
+
+時鐘在背景繼續走時：
+
+進入改時間/改鬧鐘時，若沒有把 1 秒鐘的 one_sec_tick 或秒計數器關掉，背景時間一到 1 秒，整個時鐘就會全體進位。
+
+互斥鎖定（避免同時按到）：
+
+為了絕對保證「一次只有一顆按鍵生效」，應改用 if ... else if 的優先級或互斥解碼，防止按鍵微小的訊號干擾觸發到其他位數。
+
+正確且嚴謹的寫法
+要達成：「按住 SW8（或 SW7）時，按住 SW6 就『只有 SW6 對應的時十位』會隨秒數增加，其餘 5 個數字完全鎖死不動；放開 SW6 就停」，把第四區塊的時間/鬧鐘狀態機改為以下寫法：
+
+Verilog
+//---------------------------------------------------------
+// 4. 時間暫存器與進位控制
+//---------------------------------------------------------
+always @(posedge clk or posedge reset) begin
+    if (reset) begin
+        q0 <= 4'd0; q1 <= 4'd0; q2 <= 4'd0;
+        q3 <= 4'd0; q4 <= 4'd0; q5 <= 4'd0;
+        al_q0 <= 4'd0; al_q1 <= 4'd0; al_q2 <= 4'd0;
+        al_q3 <= 4'd0; al_q4 <= 4'd0; al_q5 <= 4'd0;
+    end else begin
+        // ============================================================
+        // 模式 A: 按住 SW8 調整時間
+        // 使用 else if 互斥：一次絕對只會更新「被按下的那一顆」，其餘原封不動
+        // ============================================================
+        if (mode_set_time) begin
+            if (inc_trig[5]) begin // 只按 SW6: 調整時十位 (0~2)
+                if (q5 >= 4'd2) begin
+                    q5 <= 4'd0;
+                end else if (q5 == 4'd1 && q4 > 4'd3) begin
+                    q5 <= 4'd2;
+                    q4 <= 4'd3;
+                end else begin
+                    q5 <= q5 + 1'b1;
+                end
+            end
+            else if (inc_trig[4]) begin // 只按 SW5: 調整時個位
+                if (q5 == 4'd2 && q4 >= 4'd3) q4 <= 4'd0;
+                else if (q4 >= 4'd9)           q4 <= 4'd0;
+                else                          q4 <= q4 + 1'b1;
+            end
+            else if (inc_trig[3]) begin // 只按 SW4: 調整分十位 (0~5)
+                q3 <= (q3 >= 4'd5) ? 4'd0 : (q3 + 1'b1);
+            end
+            else if (inc_trig[2]) begin // 只按 SW3: 調整分個位 (0~9)
+                q2 <= (q2 >= 4'd9) ? 4'd0 : (q2 + 1'b1);
+            end
+            else if (inc_trig[1]) begin // 只按 SW2: 調整秒十位 (0~5)
+                q1 <= (q1 >= 4'd5) ? 4'd0 : (q1 + 1'b1);
+            end
+            else if (inc_trig[0]) begin // 只按 SW1: 調整秒個位 (0~9)
+                q0 <= (q0 >= 4'd9) ? 4'd0 : (q0 + 1'b1);
+            end
+            // 沒按 SW1~SW6 時，全部 q0~q5 保持原值，不走時、不進位
+        end
+
+        // ============================================================
+        // 模式 B: 按住 SW7 調整鬧鐘
+        // ============================================================
+        else if (mode_set_alarm) begin
+            if (inc_trig[5]) begin // SW6: 鬧鐘時十位
+                if (al_q5 >= 4'd2) begin
+                    al_q5 <= 4'd0;
+                end else if (al_q5 == 4'd1 && al_q4 > 4'd3) begin
+                    al_q5 <= 4'd2;
+                    al_q4 <= 4'd3;
+                end else begin
+                    al_q5 <= al_q5 + 1'b1;
+                end
+            end
+            else if (inc_trig[4]) begin // SW5: 鬧鐘時個位
+                if (al_q5 == 4'd2 && al_q4 >= 4'd3) al_q4 <= 4'd0;
+                else if (al_q4 >= 4'd9)              al_q4 <= 4'd0;
+                else                                 al_q4 <= al_q4 + 1'b1;
+            end
+            else if (inc_trig[3]) begin // SW4: 鬧鐘分十位
+                al_q3 <= (al_q3 >= 4'd5) ? 4'd0 : (al_q3 + 1'b1);
+            end
+            else if (inc_trig[2]) begin // SW3: 鬧鐘分個位
+                al_q2 <= (al_q2 >= 4'd9) ? 4'd0 : (al_q2 + 1'b1);
+            end
+            else if (inc_trig[1]) begin // SW2: 鬧鐘秒十位
+                al_q1 <= (al_q1 >= 4'd5) ? 4'd0 : (al_q1 + 1'b1);
+            end
+            else if (inc_trig[0]) begin // SW1: 鬧鐘秒個位
+                al_q0 <= (al_q0 >= 4'd9) ? 4'd0 : (al_q0 + 1'b1);
+            end
+        end
+
+        // ============================================================
+        // 模式 C: 正常走時
+        // 只有 SW8 與 SW7 都放開時，才允許每秒正常進位
+        // ============================================================
+        else if (one_sec_tick) begin
+            if (q0 < 4'd9) begin
+                q0 <= q0 + 1'b1;
+            end else begin
+                q0 <= 4'd0;
+                if (q1 < 4'd5) begin
+                    q1 <= q1 + 1'b1;
+                end else begin
+                    q1 <= 4'd0;
+                    if (q2 < 4'd9) begin
+                        q2 <= q2 + 1'b1;
+                    end else begin
+                        q2 <= 4'd0;
+                        if (q3 < 4'd5) begin
+                            q3 <= q3 + 1'b1;
+                        end else begin
+                            q3 <= 4'd0;
+                            if (q5 == 4'd2 && q4 == 4'd3) begin
+                                q4 <= 4'd0;
+                                q5 <= 4'd0;
+                            end else if (q4 < 4'd9) begin
+                                q4 <= q4 + 1'b1;
+                            end else begin
+                                q4 <= 4'd0;
+                                q5 <= q5 + 1'b1;
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+為什麼這樣改就能徹底解決？
+防止時間在背景進位：
+正常走時放在最後的 else if (one_sec_tick)。當 mode_set_time（按住 SW8）成立時，程式流程只會進入模式 A，底下的正常走時程式碼直接被跳過，因此其他位數絕對不會自己隨秒數跑動。
+
+互斥優先級（if ... else if）：
+在模式 A 內部，各個按鍵改用 else if 串接。當你按住 SW8 並按下 SW6 時，只有 SW6（時十位）進入遞增邏輯，其餘位數沒有指派任何新值，硬體會直接維持暫存器原本的值（保持不動）。
